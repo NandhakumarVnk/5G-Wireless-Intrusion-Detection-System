@@ -1,0 +1,19 @@
+# Dataset
+dataset/
+
+# Generated outputs
+outputs/
+
+# Trained models
+saved_models/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# VS Code
+.vscode/
