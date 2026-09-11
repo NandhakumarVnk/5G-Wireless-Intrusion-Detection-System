@@ -1,170 +1,423 @@
+
 import os
+import sys
 import random
+from collections import Counter
+
+import numpy as np
 import torch
 import torch.nn as nn
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from htstcl_gnn import HTSTCL_GNN
-from graph_augmentation import GraphAugmentation
-from contrastive_loss import ContrastiveLoss
-from sequence_dataloader import SequenceDataset, collate_fn
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_fscore_support,
+    confusion_matrix,
+    classification_report
+)
 
-# ==========================================================
-# HTSTCL-GNN TRAINING
-# ==========================================================
+from tqdm.auto import tqdm
 
-print("=" * 60)
-print("HTSTCL-GNN TRAINING")
-print("=" * 60)
 
-# ==========================================================
-# Configuration
-# ==========================================================
+# ============================================================
+# PATH CONFIGURATION
+# ============================================================
 
-BATCH_SIZE = 16
-EPOCHS = 20
+PROJECT_DIR = "/kaggle/working"
 
-LEARNING_RATE = 0.001
+DATASET_DIR = (
+    "/kaggle/input/datasets/nandhunk07/5g-ids"
+)
 
-LAMBDA_CONTRASTIVE = 0.10
+SEQUENCE_DATASET_PATH = os.path.join(
+    DATASET_DIR,
+    "graph_sequences.pt"
+)
 
-TRAIN_RATIO = 0.80
+SAVE_DIR = os.path.join(
+    PROJECT_DIR,
+    "saved_models"
+)
+
+os.makedirs(
+    SAVE_DIR,
+    exist_ok=True
+)
+
+
+# ============================================================
+# IMPORT MODEL
+# ============================================================
+
+sys.path.insert(
+    0,
+    PROJECT_DIR
+)
+
+from models.htstcl_gnn import HTSTCL_GNN
+
+
+# ============================================================
+# TRAINING CONFIGURATION
+# ============================================================
 
 RANDOM_SEED = 42
 
+BATCH_SIZE = 32
+
+MAX_EPOCHS = 30
+
+LEARNING_RATE = 1e-4
+
+WEIGHT_DECAY = 1e-4
+
+PATIENCE = 7
+
+INPUT_DIM = 91
+
+HIDDEN_DIM = 128
+
+EMBEDDING_DIM = 128
+
+NUM_CLASSES = 2
+
+GRU_LAYERS = 2
+
+DROPOUT = 0.3
+
+
+# IMPORTANT:
+# Kaggle previously produced mmap / shared-memory errors.
+NUM_WORKERS = 0
+
+
 DEVICE = torch.device(
-
     "cuda"
-
     if torch.cuda.is_available()
-
     else "cpu"
-
 )
 
-print("Device :", DEVICE)
 
-# ==========================================================
-# Reproducibility
-# ==========================================================
+# ============================================================
+# REPRODUCIBILITY
+# ============================================================
 
-random.seed(RANDOM_SEED)
+def set_seed(seed):
 
-torch.manual_seed(RANDOM_SEED)
+    random.seed(seed)
 
-if torch.cuda.is_available():
+    np.random.seed(seed)
 
-    torch.cuda.manual_seed_all(RANDOM_SEED)
+    torch.manual_seed(seed)
 
-# ==========================================================
-# Load Sequence Dataset
-# ==========================================================
+    if torch.cuda.is_available():
 
-dataset = torch.load(
+        torch.cuda.manual_seed(seed)
 
-    "outputs/sequence_dataset/graph_sequences.pt",
+        torch.cuda.manual_seed_all(seed)
 
+
+set_seed(
+    RANDOM_SEED
+)
+
+
+# ============================================================
+# CUDA OPTIMIZATION
+# ============================================================
+
+if DEVICE.type == "cuda":
+
+    torch.backends.cudnn.benchmark = True
+
+
+# ============================================================
+# DISPLAY CONFIGURATION
+# ============================================================
+
+print("\n" + "=" * 70)
+print("HTSTCL-GNN FAST & STABLE TRAINING")
+print("=" * 70)
+
+print(f"Device             : {DEVICE}")
+print(f"Batch Size         : {BATCH_SIZE}")
+print(f"Maximum Epochs     : {MAX_EPOCHS}")
+print(f"Learning Rate      : {LEARNING_RATE}")
+print(f"Weight Decay       : {WEIGHT_DECAY}")
+print(f"Dropout            : {DROPOUT}")
+print(f"Early Stop Patience: {PATIENCE}")
+print(f"DataLoader Workers : {NUM_WORKERS}")
+
+
+# ============================================================
+# LOAD DATASET
+# ============================================================
+
+print("\nLoading graph sequences dataset...")
+
+if not os.path.exists(
+    SEQUENCE_DATASET_PATH
+):
+
+    raise FileNotFoundError(
+        f"Dataset not found:\n"
+        f"{SEQUENCE_DATASET_PATH}"
+    )
+
+
+full_dataset = torch.load(
+    SEQUENCE_DATASET_PATH,
     weights_only=False
-
 )
 
-print("\nTotal Temporal Sequences :", len(dataset))
 
-# ==========================================================
-# Shuffle Dataset
-# ==========================================================
-
-random.shuffle(dataset)
-
-# ==========================================================
-# Train / Test Split
-# ==========================================================
-
-train_size = int(
-
-    TRAIN_RATIO *
-
-    len(dataset)
-
+print(
+    f"Total sequences: "
+    f"{len(full_dataset)}"
 )
 
-train_data = dataset[:train_size]
 
-test_data = dataset[train_size:]
+# ============================================================
+# DATASET VERIFICATION
+# ============================================================
 
-print("Training Sequences :", len(train_data))
-print("Testing Sequences  :", len(test_data))
+sample = full_dataset[0]
 
-# ==========================================================
-# Compute Class Weights
-# ==========================================================
+print("\n" + "=" * 70)
+print("VERIFYING DATASET")
+print("=" * 70)
 
-benign_count = sum(
-
-    sample["label"] == 0
-
-    for sample in train_data
-
+print(
+    "Sample type:",
+    type(sample)
 )
 
-malicious_count = sum(
-
-    sample["label"] == 1
-
-    for sample in train_data
-
+print(
+    "Available keys:",
+    sample.keys()
 )
 
-print("\n")
-print("=" * 60)
-print("TRAINING DATASET DISTRIBUTION")
-print("=" * 60)
+print(
+    "Graphs per sequence:",
+    len(sample["graphs"])
+)
 
-print("Benign Sequences    :", benign_count)
-print("Malicious Sequences :", malicious_count)
+print(
+    "First label:",
+    sample["label"]
+)
 
-total = benign_count + malicious_count
 
-class_weights = torch.tensor(
+# ============================================================
+# LABEL FUNCTION
+# ============================================================
 
+def get_label(sample):
+
+    label = sample["label"]
+
+    if torch.is_tensor(label):
+
+        label = label.item()
+
+    return int(label)
+
+
+# ============================================================
+# EXTRACT LABELS
+# ============================================================
+
+print("\nExtracting labels...")
+
+all_labels = np.array(
     [
-
-        total / (2 * benign_count),
-
-        total / (2 * malicious_count)
-
-    ],
-
-    dtype=torch.float32,
-
-    device=DEVICE
-
+        get_label(sample)
+        for sample in full_dataset
+    ]
 )
 
-print("\nClass Weights")
 
-print(class_weights)
-
-# ==========================================================
-# Create Dataset Objects
-# ==========================================================
-
-train_dataset = SequenceDataset(
-
-    train_data
-
+print(
+    "Full dataset distribution:",
+    Counter(all_labels.tolist())
 )
 
-test_dataset = SequenceDataset(
 
-    test_data
+# ============================================================
+# STRATIFIED SPLIT
+#
+# 70% Training
+# 15% Validation
+# 15% Testing
+# ============================================================
 
+all_indices = np.arange(
+    len(full_dataset)
 )
 
-# ==========================================================
-# DataLoader
-# ==========================================================
+
+train_indices, temp_indices = train_test_split(
+
+    all_indices,
+
+    test_size=0.30,
+
+    random_state=RANDOM_SEED,
+
+    stratify=all_labels
+)
+
+
+temp_labels = all_labels[
+    temp_indices
+]
+
+
+val_indices, test_indices = train_test_split(
+
+    temp_indices,
+
+    test_size=0.50,
+
+    random_state=RANDOM_SEED,
+
+    stratify=temp_labels
+)
+
+
+train_dataset = Subset(
+    full_dataset,
+    train_indices.tolist()
+)
+
+val_dataset = Subset(
+    full_dataset,
+    val_indices.tolist()
+)
+
+test_dataset = Subset(
+    full_dataset,
+    test_indices.tolist()
+)
+
+
+# ============================================================
+# VERIFY SPLIT
+# ============================================================
+
+train_labels = all_labels[
+    train_indices
+]
+
+val_labels = all_labels[
+    val_indices
+]
+
+test_labels = all_labels[
+    test_indices
+]
+
+
+print("\n" + "=" * 70)
+print("DATASET SPLIT")
+print("=" * 70)
+
+print(
+    f"Train      : "
+    f"{len(train_dataset)}"
+)
+
+print(
+    f"Validation : "
+    f"{len(val_dataset)}"
+)
+
+print(
+    f"Test       : "
+    f"{len(test_dataset)}"
+)
+
+
+print("\nTRAIN DISTRIBUTION")
+
+print(
+    Counter(
+        train_labels.tolist()
+    )
+)
+
+
+print("\nVALIDATION DISTRIBUTION")
+
+print(
+    Counter(
+        val_labels.tolist()
+    )
+)
+
+
+print("\nTEST DISTRIBUTION")
+
+print(
+    Counter(
+        test_labels.tolist()
+    )
+)
+
+
+# ============================================================
+# COLLATE FUNCTION
+#
+# Model receives:
+#
+# [
+#   [graph1, graph2, graph3, graph4, graph5],
+#   [graph1, graph2, graph3, graph4, graph5],
+#   ...
+# ]
+# ============================================================
+
+def collate_fn(batch):
+
+    sequences = []
+
+    labels = []
+
+    for sample in batch:
+
+        sequences.append(
+            sample["graphs"]
+        )
+
+        labels.append(
+            get_label(sample)
+        )
+
+
+    labels = torch.tensor(
+        labels,
+        dtype=torch.long
+    )
+
+
+    return (
+        sequences,
+        labels
+    )
+
+
+# ============================================================
+# DATALOADERS
+#
+# NUM_WORKERS=0 avoids Kaggle mmap error.
+# ============================================================
+
+PIN_MEMORY = (
+    DEVICE.type == "cuda"
+)
+
 
 train_loader = DataLoader(
 
@@ -174,9 +427,29 @@ train_loader = DataLoader(
 
     shuffle=True,
 
-    collate_fn=collate_fn
+    num_workers=NUM_WORKERS,
 
+    pin_memory=PIN_MEMORY,
+
+    collate_fn=collate_fn
 )
+
+
+val_loader = DataLoader(
+
+    val_dataset,
+
+    batch_size=BATCH_SIZE,
+
+    shuffle=False,
+
+    num_workers=NUM_WORKERS,
+
+    pin_memory=PIN_MEMORY,
+
+    collate_fn=collate_fn
+)
+
 
 test_loader = DataLoader(
 
@@ -186,85 +459,150 @@ test_loader = DataLoader(
 
     shuffle=False,
 
-    collate_fn=collate_fn
+    num_workers=NUM_WORKERS,
 
+    pin_memory=PIN_MEMORY,
+
+    collate_fn=collate_fn
 )
 
-# ==========================================================
-# Show Sample
-# ==========================================================
 
-sample = train_dataset[0]
+print("\n" + "=" * 70)
+print("DATALOADERS CREATED")
+print("=" * 70)
 
-print("\n")
-print("=" * 60)
-print("FIRST TRAINING SAMPLE")
-print("=" * 60)
+print(
+    f"Train batches      : "
+    f"{len(train_loader)}"
+)
 
-print("Sequence Label      :", sample["label"])
-print("Graphs in Sequence  :", len(sample["graphs"]))
-print("Malicious Graphs    :", sample["malicious_graphs"])
-print("Benign Graphs       :", sample["benign_graphs"])
-print("Malicious Nodes     :", sample["malicious_nodes"])
-print("Benign Nodes        :", sample["benign_nodes"])
+print(
+    f"Validation batches : "
+    f"{len(val_loader)}"
+)
 
-# ==========================================================
-# Create HTSTCL-GNN
-# ==========================================================
+print(
+    f"Test batches       : "
+    f"{len(test_loader)}"
+)
+
+
+# ============================================================
+# CLASS WEIGHTS
+# ============================================================
+
+class_counts = np.bincount(
+
+    train_labels,
+
+    minlength=NUM_CLASSES
+)
+
+
+class_weights = (
+
+    len(train_labels)
+
+    /
+
+    (
+
+        NUM_CLASSES
+
+        *
+
+        class_counts
+    )
+)
+
+
+class_weights = torch.tensor(
+
+    class_weights,
+
+    dtype=torch.float32,
+
+    device=DEVICE
+)
+
+
+print("\n" + "=" * 70)
+print("TRAINING CLASS DISTRIBUTION")
+print("=" * 70)
+
+print(
+    f"Benign     : "
+    f"{class_counts[0]}"
+)
+
+print(
+    f"Malicious  : "
+    f"{class_counts[1]}"
+)
+
+print(
+    "\nClass Weights:",
+    class_weights
+)
+
+
+# ============================================================
+# CREATE MODEL
+# ============================================================
 
 model = HTSTCL_GNN(
 
-    input_dim=91,
+    input_dim=INPUT_DIM,
 
-    hidden_dim=128,
+    hidden_dim=HIDDEN_DIM,
 
-    embedding_dim=128,
+    embedding_dim=EMBEDDING_DIM,
 
-    num_classes=2,
+    num_classes=NUM_CLASSES,
 
-    gru_layers=2,
+    gru_layers=GRU_LAYERS,
 
-    dropout=0.3
+    dropout=DROPOUT
 
-).to(DEVICE)
+).to(
+    DEVICE
+)
 
-print("\nHTSTCL-GNN Created Successfully")
 
-# ==========================================================
-# Graph Augmentation
-# ==========================================================
+print("\n" + "=" * 70)
+print("MODEL")
+print("=" * 70)
 
-augmentor = GraphAugmentation()
+print(model)
 
-print("Graph Augmentation Ready")
 
-# ==========================================================
-# Loss Functions
-# ==========================================================
+# ============================================================
+# LOSS FUNCTION
+# ============================================================
 
-classification_loss_fn = nn.CrossEntropyLoss(
+criterion = nn.CrossEntropyLoss(
 
     weight=class_weights
-
 )
 
-contrastive_loss_fn = ContrastiveLoss(
 
-    temperature=0.5
+# ============================================================
+# OPTIMIZER
+# ============================================================
 
-)
-
-optimizer = torch.optim.Adam(
+optimizer = torch.optim.AdamW(
 
     model.parameters(),
 
-    lr=LEARNING_RATE
+    lr=LEARNING_RATE,
 
+    weight_decay=WEIGHT_DECAY
 )
 
-# ==========================================================
-# Learning Rate Scheduler
-# ==========================================================
+
+# ============================================================
+# LEARNING RATE SCHEDULER
+# ============================================================
 
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 
@@ -274,636 +612,934 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 
     factor=0.5,
 
-    patience=3
-
+    patience=2
 )
 
-# ==========================================================
-# Save Directory
-# ==========================================================
 
-os.makedirs(
+# ============================================================
+# AUTOMATIC MIXED PRECISION
+# ============================================================
 
-    "saved_models",
-
-    exist_ok=True
-
+scaler = torch.amp.GradScaler(
+    "cuda",
+    enabled=(DEVICE.type == "cuda")
 )
 
-best_loss = float("inf")
-# ==========================================================
-# Training
-# ==========================================================
 
-for epoch in range(EPOCHS):
+# ============================================================
+# TRAIN ONE EPOCH
+# ============================================================
+
+def train_one_epoch(epoch):
 
     model.train()
 
-    total_loss = 0.0
-    total_classification_loss = 0.0
-    total_contrastive_loss = 0.0
+    running_loss = 0.0
 
-    total_correct = 0
-    total_samples = 0
+    correct = 0
 
-    print("\n")
-    print("-" * 60)
-    print(f"Epoch {epoch + 1}/{EPOCHS}")
-    print("-" * 60)
+    total = 0
 
-    # ======================================================
-    # Train over mini-batches
-    # ======================================================
 
-    for batch in train_loader:
+    progress_bar = tqdm(
 
-        batch_view1 = []
-        batch_view2 = []
-        targets = []
+        train_loader,
 
-        # --------------------------------------------------
-        # Create two augmented views
-        # --------------------------------------------------
+        desc=f"Training Epoch {epoch}",
 
-        for sample in batch:
+        leave=True
+    )
 
-            graph_sequence = sample["graphs"]
 
-            label = sample["label"]
+    for batch_sequences, labels in progress_bar:
 
-            # Generate two graph augmentations
-            view1, view2 = augmentor(graph_sequence)
 
-            # Move graphs to device
-            view1 = [
+        labels = labels.to(
 
-                graph.to(DEVICE)
+            DEVICE,
 
-                for graph in view1
+            non_blocking=True
+        )
 
-            ]
 
-            view2 = [
+        optimizer.zero_grad(
 
-                graph.to(DEVICE)
+            set_to_none=True
+        )
 
-                for graph in view2
 
-            ]
+        with torch.amp.autocast(
 
-            batch_view1.append(
+            device_type=DEVICE.type,
 
-                {
+            enabled=(DEVICE.type == "cuda")
+        ):
 
-                    "graphs": view1,
-
-                    "label": label
-
-                }
-
+            output = model(
+                batch_sequences
             )
 
-            batch_view2.append(
+            logits = output[
+                "logits"
+            ]
 
-                {
+            loss = criterion(
 
-                    "graphs": view2,
+                logits,
 
-                    "label": label
-
-                }
-
+                labels
             )
 
-            targets.append(label)
 
-        # --------------------------------------------------
-        # Target Tensor
-        # --------------------------------------------------
+        scaler.scale(
+            loss
+        ).backward()
 
-        targets = torch.tensor(
 
-            targets,
-
-            dtype=torch.long,
-
-            device=DEVICE
-
+        scaler.unscale_(
+            optimizer
         )
 
-        optimizer.zero_grad()
-
-        # --------------------------------------------------
-        # Forward Pass
-        # --------------------------------------------------
-
-        output1 = model(batch_view1)
-
-        output2 = model(batch_view2)
-
-        logits = output1["logits"]
-
-        projection1 = output1["projection"]
-
-        projection2 = output2["projection"]
-
-        # --------------------------------------------------
-        # Classification Loss
-        # --------------------------------------------------
-
-        classification_loss = classification_loss_fn(
-
-            logits,
-
-            targets
-
-        )
-
-        # --------------------------------------------------
-        # Contrastive Loss
-        # --------------------------------------------------
-
-        contrastive_loss = contrastive_loss_fn(
-
-            projection1,
-
-            projection2
-
-        )
-
-        # --------------------------------------------------
-        # Combined Loss
-        # --------------------------------------------------
-
-        loss = (
-
-            classification_loss +
-
-            LAMBDA_CONTRASTIVE *
-
-            contrastive_loss
-
-        )
-                # --------------------------------------------------
-        # Backpropagation
-        # --------------------------------------------------
-
-        loss.backward()
-
-        # Gradient Clipping
 
         torch.nn.utils.clip_grad_norm_(
 
             model.parameters(),
 
-            max_norm=5.0
-
+            max_norm=1.0
         )
 
-        optimizer.step()
 
-        # --------------------------------------------------
-        # Statistics
-        # --------------------------------------------------
+        scaler.step(
+            optimizer
+        )
 
-        total_loss += loss.item()
 
-        total_classification_loss += classification_loss.item()
+        scaler.update()
 
-        total_contrastive_loss += contrastive_loss.item()
+
+        running_loss += (
+            loss.item()
+            *
+            labels.size(0)
+        )
+
 
         predictions = torch.argmax(
 
             logits,
 
             dim=1
-
         )
 
-        total_correct += (
-
-            predictions == targets
-
-        ).sum().item()
-
-        total_samples += targets.size(0)
-
-    # ======================================================
-    # Epoch Statistics
-    # ======================================================
-
-    average_loss = (
-
-        total_loss /
-
-        len(train_loader)
-
-    )
-
-    average_classification_loss = (
-
-        total_classification_loss /
-
-        len(train_loader)
-
-    )
-
-    average_contrastive_loss = (
-
-        total_contrastive_loss /
-
-        len(train_loader)
-
-    )
-
-    train_accuracy = (
-
-        total_correct /
-
-        total_samples
-
-    ) * 100
-
-    print(f"Classification Loss : {average_classification_loss:.4f}")
-
-    print(f"Contrastive Loss    : {average_contrastive_loss:.4f}")
-
-    print(f"Total Loss          : {average_loss:.4f}")
-
-    print(f"Training Accuracy   : {train_accuracy:.2f}%")
-
-    # ======================================================
-    # Learning Rate Scheduler
-    # ======================================================
-
-    scheduler.step(
-
-        average_loss
-
-    )
-
-    current_lr = optimizer.param_groups[0]["lr"]
-
-    print(f"Learning Rate       : {current_lr:.6f}")
-
-    # ======================================================
-    # Save Best Model
-    # ======================================================
-
-    if average_loss < best_loss:
-
-        best_loss = average_loss
-
-        torch.save(
-
-            model.state_dict(),
-
-            "saved_models/htstcl_gnn_best.pth"
-
-        )
-
-        print("Best Model Updated")
-        # ==========================================================
-# Evaluation
-# ==========================================================
-
-print("\n")
-print("=" * 60)
-print("MODEL EVALUATION")
-print("=" * 60)
-
-# ----------------------------------------------------------
-# Load Best Model
-# ----------------------------------------------------------
-
-model.load_state_dict(
-
-    torch.load(
-
-        "saved_models/htstcl_gnn_best.pth",
-
-        map_location=DEVICE
-
-    )
-
-)
-
-model.eval()
-
-correct = 0
-total = 0
-
-true_labels = []
-predicted_labels = []
-
-evaluation_loss = 0.0
-
-with torch.no_grad():
-
-    for batch in test_loader:
-
-        batch_sequences = []
-        targets = []
-
-        # --------------------------------------------------
-        # Move graphs to device
-        # --------------------------------------------------
-
-        for sample in batch:
-
-            graphs = [
-
-                graph.to(DEVICE)
-
-                for graph in sample["graphs"]
-
-            ]
-
-            batch_sequences.append(
-
-                {
-
-                    "graphs": graphs,
-
-                    "label": sample["label"]
-
-                }
-
-            )
-
-            targets.append(
-
-                sample["label"]
-
-            )
-
-        targets = torch.tensor(
-
-            targets,
-
-            dtype=torch.long,
-
-            device=DEVICE
-
-        )
-
-        # --------------------------------------------------
-        # Forward Pass
-        # --------------------------------------------------
-
-        output = model(
-
-            batch_sequences
-
-        )
-
-        logits = output["logits"]
-
-        # --------------------------------------------------
-        # Evaluation Loss
-        # --------------------------------------------------
-
-        loss = classification_loss_fn(
-
-            logits,
-
-            targets
-
-        )
-
-        evaluation_loss += loss.item()
-
-        # --------------------------------------------------
-        # Predictions
-        # --------------------------------------------------
-
-        predictions = torch.argmax(
-
-            logits,
-
-            dim=1
-
-        )
 
         correct += (
 
-            predictions == targets
+            predictions == labels
 
         ).sum().item()
 
-        total += targets.size(0)
+
+        total += labels.size(0)
+
+
+        accuracy = (
+
+            100.0
+
+            *
+
+            correct
+
+            /
+
+            total
+        )
+
+
+        progress_bar.set_postfix(
+
+            loss=f"{loss.item():.4f}",
+
+            acc=f"{accuracy:.2f}%"
+        )
+
+
+    epoch_loss = (
+
+        running_loss
+
+        /
+
+        total
+    )
+
+
+    epoch_accuracy = (
+
+        100.0
+
+        *
+
+        correct
+
+        /
+
+        total
+    )
+
+
+    return (
+
+        epoch_loss,
+
+        epoch_accuracy
+    )
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate(epoch):
+
+    model.eval()
+
+    running_loss = 0.0
+
+    correct = 0
+
+    total = 0
+
+    true_labels = []
+
+    predicted_labels = []
+
+
+    progress_bar = tqdm(
+
+        val_loader,
+
+        desc=f"Validation Epoch {epoch}",
+
+        leave=True
+    )
+
+
+    with torch.no_grad():
+
+        for batch_sequences, labels in progress_bar:
+
+
+            labels = labels.to(
+
+                DEVICE,
+
+                non_blocking=True
+            )
+
+
+            with torch.amp.autocast(
+
+                device_type=DEVICE.type,
+
+                enabled=(DEVICE.type == "cuda")
+            ):
+
+                output = model(
+                    batch_sequences
+                )
+
+
+                logits = output[
+                    "logits"
+                ]
+
+
+                loss = criterion(
+
+                    logits,
+
+                    labels
+                )
+
+
+            running_loss += (
+
+                loss.item()
+
+                *
+
+                labels.size(0)
+            )
+
+
+            predictions = torch.argmax(
+
+                logits,
+
+                dim=1
+            )
+
+
+            correct += (
+
+                predictions == labels
+
+            ).sum().item()
+
+
+            total += labels.size(0)
+
+
+            true_labels.extend(
+
+                labels.cpu().numpy()
+            )
+
+
+            predicted_labels.extend(
+
+                predictions.cpu().numpy()
+            )
+
+
+            accuracy = (
+
+                100.0
+
+                *
+
+                correct
+
+                /
+
+                total
+            )
+
+
+            progress_bar.set_postfix(
+
+                loss=f"{loss.item():.4f}",
+
+                acc=f"{accuracy:.2f}%"
+            )
+
+
+    epoch_loss = (
+
+        running_loss
+
+        /
+
+        total
+    )
+
+
+    epoch_accuracy = (
+
+        100.0
+
+        *
+
+        correct
+
+        /
+
+        total
+    )
+
+
+    return (
+
+        epoch_loss,
+
+        epoch_accuracy,
+
+        true_labels,
+
+        predicted_labels
+    )
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+history = {
+
+    "train_loss": [],
+
+    "train_accuracy": [],
+
+    "val_loss": [],
+
+    "val_accuracy": [],
+
+    "learning_rate": []
+}
+
+
+# ============================================================
+# BEST MODEL
+# ============================================================
+
+best_val_loss = float("inf")
+
+best_epoch = 0
+
+epochs_without_improvement = 0
+
+
+best_model_path = os.path.join(
+
+    SAVE_DIR,
+
+    "htstcl_gnn_best.pth"
+)
+
+
+# ============================================================
+# START TRAINING
+# ============================================================
+
+print("\n" + "=" * 70)
+print("STARTING TRAINING")
+print("=" * 70)
+
+
+for epoch in range(
+
+    1,
+
+    MAX_EPOCHS + 1
+):
+
+
+    print("\n" + "=" * 70)
+
+    print(
+        f"EPOCH {epoch}/{MAX_EPOCHS}"
+    )
+
+    print("=" * 70)
+
+
+    # TRAIN
+
+    train_loss, train_accuracy = train_one_epoch(
+        epoch
+    )
+
+
+    # VALIDATION
+
+    (
+
+        val_loss,
+
+        val_accuracy,
+
+        val_true,
+
+        val_pred
+
+    ) = validate(
+        epoch
+    )
+
+
+    # UPDATE LEARNING RATE
+
+    scheduler.step(
+        val_loss
+    )
+
+
+    current_lr = optimizer.param_groups[0][
+        "lr"
+    ]
+
+
+    # SAVE HISTORY
+
+    history["train_loss"].append(
+        train_loss
+    )
+
+    history["train_accuracy"].append(
+        train_accuracy
+    )
+
+    history["val_loss"].append(
+        val_loss
+    )
+
+    history["val_accuracy"].append(
+        val_accuracy
+    )
+
+    history["learning_rate"].append(
+        current_lr
+    )
+
+
+    # RESULTS
+
+    print("\nEpoch Results")
+
+    print(
+        f"Train Loss       : "
+        f"{train_loss:.6f}"
+    )
+
+    print(
+        f"Train Accuracy   : "
+        f"{train_accuracy:.2f}%"
+    )
+
+    print(
+        f"Validation Loss  : "
+        f"{val_loss:.6f}"
+    )
+
+    print(
+        f"Validation Acc   : "
+        f"{val_accuracy:.2f}%"
+    )
+
+    print(
+        f"Learning Rate    : "
+        f"{current_lr:.8f}"
+    )
+
+
+    # ========================================================
+    # BEST MODEL
+    # ========================================================
+
+    if val_loss < best_val_loss:
+
+
+        best_val_loss = val_loss
+
+        best_epoch = epoch
+
+        epochs_without_improvement = 0
+
+
+        torch.save(
+
+            {
+
+                "epoch": epoch,
+
+                "model_state_dict": model.state_dict(),
+
+                "optimizer_state_dict": optimizer.state_dict(),
+
+                "val_loss": val_loss,
+
+                "val_accuracy": val_accuracy,
+
+                "history": history
+
+            },
+
+            best_model_path
+        )
+
+
+        print(
+            "\n🏆 New Best Model Saved!"
+        )
+
+
+    else:
+
+
+        epochs_without_improvement += 1
+
+
+        print(
+
+            f"\nNo validation improvement: "
+
+            f"{epochs_without_improvement}/{PATIENCE}"
+        )
+
+
+    # ========================================================
+    # EARLY STOPPING
+    # ========================================================
+
+    if epochs_without_improvement >= PATIENCE:
+
+
+        print(
+            "\nEarly stopping triggered."
+        )
+
+        break
+
+
+# ============================================================
+# LOAD BEST MODEL
+# ============================================================
+
+print("\n" + "=" * 70)
+print("LOADING BEST MODEL")
+print("=" * 70)
+
+
+checkpoint = torch.load(
+
+    best_model_path,
+
+    map_location=DEVICE,
+
+    weights_only=False
+)
+
+
+model.load_state_dict(
+
+    checkpoint[
+        "model_state_dict"
+    ]
+)
+
+
+model.eval()
+
+
+print(
+    f"Best Epoch              : "
+    f"{checkpoint['epoch']}"
+)
+
+print(
+    f"Best Validation Loss    : "
+    f"{checkpoint['val_loss']:.6f}"
+)
+
+print(
+    f"Best Validation Accuracy: "
+    f"{checkpoint['val_accuracy']:.2f}%"
+)
+
+
+# ============================================================
+# FINAL TEST
+# ============================================================
+
+print("\n" + "=" * 70)
+print("FINAL TEST EVALUATION")
+print("=" * 70)
+
+
+test_loss_total = 0.0
+
+true_labels = []
+
+predicted_labels = []
+
+
+progress_bar = tqdm(
+
+    test_loader,
+
+    desc="Testing"
+)
+
+
+with torch.no_grad():
+
+    for batch_sequences, labels in progress_bar:
+
+
+        labels = labels.to(
+
+            DEVICE,
+
+            non_blocking=True
+        )
+
+
+        with torch.amp.autocast(
+
+            device_type=DEVICE.type,
+
+            enabled=(DEVICE.type == "cuda")
+        ):
+
+            output = model(
+                batch_sequences
+            )
+
+
+            logits = output[
+                "logits"
+            ]
+
+
+            loss = criterion(
+
+                logits,
+
+                labels
+            )
+
+
+        test_loss_total += (
+
+            loss.item()
+
+            *
+
+            labels.size(0)
+        )
+
+
+        predictions = torch.argmax(
+
+            logits,
+
+            dim=1
+        )
+
 
         true_labels.extend(
 
-            targets.cpu().tolist()
-
+            labels.cpu().numpy()
         )
+
 
         predicted_labels.extend(
 
-            predictions.cpu().tolist()
-
+            predictions.cpu().numpy()
         )
 
-# ==========================================================
-# Evaluation Statistics
-# ==========================================================
+
+# ============================================================
+# TEST METRICS
+# ============================================================
 
 test_loss = (
 
-    evaluation_loss /
+    test_loss_total
 
-    len(test_loader)
+    /
 
+    len(test_dataset)
 )
+
 
 test_accuracy = (
 
-    correct /
+    accuracy_score(
 
-    total
+        true_labels,
 
-) * 100
+        predicted_labels
 
-print(f"\nTest Loss     : {test_loss:.4f}")
+    )
 
-print(f"Test Accuracy : {test_accuracy:.2f}%")
+    *
 
-# ==========================================================
-# Prediction Distribution
-# ==========================================================
+    100
+)
 
-predicted_benign = predicted_labels.count(0)
 
-predicted_malicious = predicted_labels.count(1)
+precision, recall, f1, _ = (
 
-print("\nPrediction Distribution")
+    precision_recall_fscore_support(
 
-print("-----------------------------")
+        true_labels,
 
-print("Predicted Benign    :", predicted_benign)
+        predicted_labels,
 
-print("Predicted Malicious :", predicted_malicious)
-# ==========================================================
-# Precision / Recall / F1 Score
-# ==========================================================
+        average="binary",
 
-tp = fp = tn = fn = 0
+        pos_label=1,
 
-for gt, pred in zip(
+        zero_division=0
+    )
+)
+
+
+cm = confusion_matrix(
 
     true_labels,
 
     predicted_labels
-
-):
-
-    if gt == 1 and pred == 1:
-
-        tp += 1
-
-    elif gt == 0 and pred == 1:
-
-        fp += 1
-
-    elif gt == 0 and pred == 0:
-
-        tn += 1
-
-    elif gt == 1 and pred == 0:
-
-        fn += 1
-
-precision = tp / (tp + fp + 1e-8)
-
-recall = tp / (tp + fn + 1e-8)
-
-f1 = (
-
-    2 *
-
-    precision *
-
-    recall
-
-) / (
-
-    precision +
-
-    recall +
-
-    1e-8
-
 )
 
-# ==========================================================
-# Classification Report
-# ==========================================================
 
-print("\n")
-print("=" * 60)
-print("CLASSIFICATION REPORT")
-print("=" * 60)
+# ============================================================
+# PRINT TEST RESULTS
+# ============================================================
 
-print(f"Precision : {precision:.4f}")
+print(
 
-print(f"Recall    : {recall:.4f}")
+    f"\nTest Loss     : "
 
-print(f"F1 Score  : {f1:.4f}")
+    f"{test_loss:.6f}"
+)
+
+
+print(
+
+    f"Test Accuracy : "
+
+    f"{test_accuracy:.2f}%"
+)
+
+
+print(
+
+    f"Precision     : "
+
+    f"{precision:.4f}"
+)
+
+
+print(
+
+    f"Recall        : "
+
+    f"{recall:.4f}"
+)
+
+
+print(
+
+    f"F1 Score      : "
+
+    f"{f1:.4f}"
+)
+
+
+print("\nClassification Report")
+
+
+print(
+
+    classification_report(
+
+        true_labels,
+
+        predicted_labels,
+
+        target_names=[
+
+            "Benign",
+
+            "Malicious"
+
+        ],
+
+        zero_division=0
+    )
+)
+
 
 print("\nConfusion Matrix")
 
-print("-" * 35)
+print(cm)
 
-print(f"True Positive  (TP): {tp}")
 
-print(f"False Positive (FP): {fp}")
+# ============================================================
+# SAVE FINAL RESULTS
+# ============================================================
 
-print(f"True Negative  (TN): {tn}")
+final_model_path = os.path.join(
 
-print(f"False Negative (FN): {fn}")
+    SAVE_DIR,
 
-# ==========================================================
-# Save Final Model
-# ==========================================================
+    "htstcl_gnn_final.pth"
+)
+
 
 torch.save(
 
-    model.state_dict(),
+    {
 
-    "saved_models/htstcl_gnn_final.pth"
+        "model_state_dict": model.state_dict(),
 
+        "best_epoch": checkpoint["epoch"],
+
+        "best_validation_loss": checkpoint["val_loss"],
+
+        "best_validation_accuracy": checkpoint["val_accuracy"],
+
+        "test_loss": test_loss,
+
+        "test_accuracy": test_accuracy,
+
+        "precision": precision,
+
+        "recall": recall,
+
+        "f1_score": f1,
+
+        "confusion_matrix": cm,
+
+        "history": history
+
+    },
+
+    final_model_path
 )
 
-# ==========================================================
-# Final Summary
-# ==========================================================
 
-print("\n")
-print("=" * 60)
-print("TRAINING COMPLETED SUCCESSFULLY")
-print("=" * 60)
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
 
-print("Model Name           : HTSTCL-GNN")
+print("\n" + "=" * 70)
 
-print("Architecture         : Hierarchical Spatio-Temporal Contrastive Learning GNN")
+print("TRAINING COMPLETED")
 
-print("Spatial Encoder      : Graph Attention Network (GAT)")
+print("=" * 70)
 
-print("Temporal Encoder     : GRU")
+print(
+    f"Best Epoch          : "
+    f"{checkpoint['epoch']}"
+)
 
-print("Fusion Module        : Hierarchical Attention Fusion")
+print(
+    f"Best Validation Acc : "
+    f"{checkpoint['val_accuracy']:.2f}%"
+)
 
-print("Projection Head      : Enabled")
+print(
+    f"Test Accuracy       : "
+    f"{test_accuracy:.2f}%"
+)
 
-print("Graph Augmentation   : Enabled")
+print(
+    f"Precision           : "
+    f"{precision:.4f}"
+)
 
-print("Contrastive Learning : NT-Xent (InfoNCE)")
+print(
+    f"Recall              : "
+    f"{recall:.4f}"
+)
 
-print("Classification Loss  : Weighted CrossEntropyLoss")
+print(
+    f"F1 Score            : "
+    f"{f1:.4f}"
+)
 
-print("Sequence Length      : 5")
+print("\nSaved Models:")
 
-print(f"Batch Size           : {BATCH_SIZE}")
+print(
+    best_model_path
+)
 
-print("Embedding Dimension  : 128")
+print(
+    final_model_path
+)
 
-print(f"Epochs               : {EPOCHS}")
-
-print(f"Learning Rate        : {LEARNING_RATE}")
-
-print(f"Contrastive Lambda   : {LAMBDA_CONTRASTIVE}")
-
-print("\n")
-
-print(f"Training Samples     : {len(train_dataset)}")
-
-print(f"Testing Samples      : {len(test_dataset)}")
-
-print(f"Test Loss            : {test_loss:.4f}")
-
-print(f"Final Accuracy       : {test_accuracy:.2f}%")
-
-print(f"Precision            : {precision:.4f}")
-
-print(f"Recall               : {recall:.4f}")
-
-print(f"F1 Score             : {f1:.4f}")
-
-print("\nPrediction Distribution")
-
-print("-----------------------------")
-
-print(f"Predicted Benign     : {predicted_benign}")
-
-print(f"Predicted Malicious  : {predicted_malicious}")
-
-print("\nSaved Models")
-
-print("-----------------------------")
-
-print("Best Model  : saved_models/htstcl_gnn_best.pth")
-
-print("Final Model : saved_models/htstcl_gnn_final.pth")
-
-print("=" * 60)
+print("=" * 70)

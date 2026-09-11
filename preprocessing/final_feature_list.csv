@@ -1,0 +1,90 @@
+Feature_Number,Feature_Name
+1,Dur
+2,RunTime
+3,Mean
+4,Sum
+5,Min
+6,Max
+7,sTos
+8,dTos
+9,sTtl
+10,dTtl
+11,sHops
+12,dHops
+13,TotPkts
+14,SrcPkts
+15,DstPkts
+16,TotBytes
+17,SrcBytes
+18,DstBytes
+19,Offset
+20,sMeanPktSz
+21,dMeanPktSz
+22,Load
+23,SrcLoad
+24,DstLoad
+25,Loss
+26,SrcLoss
+27,DstLoss
+28,pLoss
+29,SrcGap
+30,DstGap
+31,Rate
+32,SrcRate
+33,DstRate
+34,SrcWin
+35,DstWin
+36,sVid
+37,dVid
+38,SrcTCPBase
+39,DstTCPBase
+40,TcpRtt
+41,SynAck
+42, *        
+43, *    V   
+44, *    f   
+45, e        
+46, e    f   
+47, e &      
+48, e *      
+49, e d      
+50, e g      
+51, e i      
+52, e r      
+53, e s      
+54, eU       
+55,e        
+56,arp
+57,icmp
+58,ipv6-icmp
+59,llc
+60,lldp
+61,sctp
+62,tcp
+63,udp
+64,ACC
+65,CON
+66,ECO
+67,FIN
+68,INT
+69,NRS
+70,REQ
+71,RSP
+72,RST
+73,TST
+74,URP
+75,Shutdown
+76,Start
+77,Status
+78,39
+79,4
+80,52
+81,54
+82,af11
+83,af12
+84,af41
+85,cs0
+86,cs4
+87,cs6
+88,cs7
+89,ef

@@ -1,11 +1,13 @@
+
 import torch
 import torch.nn as nn
 
+from torch_geometric.data import Batch
 from torch_geometric.nn import global_mean_pool
 
-from spatial_encoder import SpatialEncoder
-from temporal_encoder import TemporalEncoder
-from hierarchical_fusion import HierarchicalFusion
+from .spatial_encoder import SpatialEncoder
+from .temporal_encoder import TemporalEncoder
+from .hierarchical_fusion import HierarchicalFusion
 
 
 class HTSTCL_GNN(nn.Module):
@@ -22,14 +24,10 @@ class HTSTCL_GNN(nn.Module):
 
         super().__init__()
 
-        # =====================================================
-        # Configuration
-        # =====================================================
-
         self.embedding_dim = embedding_dim
 
         # =====================================================
-        # Spatial Encoder
+        # SPATIAL ENCODER
         # =====================================================
 
         self.spatial_encoder = SpatialEncoder(
@@ -41,7 +39,7 @@ class HTSTCL_GNN(nn.Module):
         )
 
         # =====================================================
-        # Temporal Encoder
+        # TEMPORAL ENCODER
         # =====================================================
 
         self.temporal_encoder = TemporalEncoder(
@@ -53,7 +51,7 @@ class HTSTCL_GNN(nn.Module):
         )
 
         # =====================================================
-        # Hierarchical Fusion
+        # HIERARCHICAL FUSION
         # =====================================================
 
         self.fusion = HierarchicalFusion(
@@ -62,7 +60,7 @@ class HTSTCL_GNN(nn.Module):
         )
 
         # =====================================================
-        # Projection Head
+        # PROJECTION HEAD
         # =====================================================
 
         self.projection_head = nn.Sequential(
@@ -79,7 +77,7 @@ class HTSTCL_GNN(nn.Module):
         )
 
         # =====================================================
-        # Graph / Sequence Classifier
+        # CLASSIFIER
         # =====================================================
 
         self.classifier = nn.Sequential(
@@ -96,184 +94,243 @@ class HTSTCL_GNN(nn.Module):
         )
 
     # =====================================================
-    # Forward
+    # FORWARD
     # =====================================================
 
     def forward(self, batch_sequences):
+
         """
-        Parameters
-        ----------
-        batch_sequences : list
+        batch_sequences:
 
-        Each element is a dictionary
+        List of sequences
 
-        {
-            "graphs": [Graph1, Graph2, Graph3, Graph4, Graph5],
-            "label": 0 or 1
-        }
+        Shape concept:
 
-        Returns
-        -------
-        Dictionary containing logits, embeddings,
-        projection vectors and attention weights.
+        Batch
+            ↓
+        Sequence Length = 5
+            ↓
+        Graphs
+
+        Example:
+
+        [
+            [G1, G2, G3, G4, G5],
+            [G1, G2, G3, G4, G5],
+            ...
+        ]
         """
-
-        batch_spatial_sequences = []
 
         # =====================================================
-        # Process every temporal sequence in the batch
+        # GET MODEL DEVICE
         # =====================================================
 
-        for sample in batch_sequences:
+        device = next(
+            self.parameters()
+        ).device
 
-            graph_sequence = sample["graphs"]
+        batch_size = len(
+            batch_sequences
+        )
 
-            sequence_embeddings = []
+        sequence_length = len(
+            batch_sequences[0]
+        )
+
+        temporal_embeddings = []
+
+        # =====================================================
+        # PROCESS EACH TEMPORAL STEP
+        #
+        # Instead of:
+        #
+        # for every sample
+        #     for every graph
+        #         run GAT
+        #
+        # We do:
+        #
+        # Collect all graphs at time step t
+        # Batch them together
+        # Run GAT only once
+        #
+        # =====================================================
+
+        for time_step in range(
+            sequence_length
+        ):
 
             # -------------------------------------------------
-            # Spatial Encoding for every graph
+            # COLLECT GRAPHS FROM ALL SAMPLES
             # -------------------------------------------------
 
-            for graph in graph_sequence:
+            graphs_at_time_step = [
 
-                x = graph.x
-                edge_index = graph.edge_index
+                batch_sequences[
+                    batch_index
+                ][
+                    time_step
+                ]
 
-                # ---------------------------------------------
-                # Node Embeddings using GAT
-                # ---------------------------------------------
-
-                node_embedding = self.spatial_encoder(
-                    x,
-                    edge_index
+                for batch_index in range(
+                    batch_size
                 )
+            ]
 
-                # ---------------------------------------------
-                # Graph Embedding using Global Mean Pooling
-                # ---------------------------------------------
+            # -------------------------------------------------
+            # CREATE PYG BATCH
+            # -------------------------------------------------
 
-                batch = torch.zeros(
-                    graph.num_nodes,
-                    dtype=torch.long,
-                    device=x.device
-                )
+            batched_graph = Batch.from_data_list(
+                graphs_at_time_step
+            )
 
-                graph_embedding = global_mean_pool(
-                    node_embedding,
-                    batch
-                )
-
-                sequence_embeddings.append(
-                    graph_embedding.squeeze(0)
-                )
-
-            # ---------------------------------------------
-            # Sequence Tensor
+            # -------------------------------------------------
+            # IMPORTANT FIX
             #
-            # Shape:
-            # Sequence Length × Embedding
+            # Move entire PyG Batch to same device as model
+            # -------------------------------------------------
+
+            batched_graph = batched_graph.to(
+                device
+            )
+
+            # -------------------------------------------------
+            # SPATIAL ENCODING
+            #
+            # All graphs processed together
+            # -------------------------------------------------
+
+            node_embeddings = self.spatial_encoder(
+
+                batched_graph.x,
+
+                batched_graph.edge_index
+
+            )
+
+            # -------------------------------------------------
+            # GRAPH LEVEL POOLING
+            #
+            # Output:
+            #
+            # Batch × Embedding
             #
             # Example:
-            # 5 × 128
-            # ---------------------------------------------
+            #
+            # 32 × 128
+            # -------------------------------------------------
 
-            sequence_embeddings = torch.stack(
-                sequence_embeddings,
-                dim=0
+            graph_embeddings = global_mean_pool(
+
+                node_embeddings,
+
+                batched_graph.batch
+
             )
 
-            batch_spatial_sequences.append(
-                sequence_embeddings
+            temporal_embeddings.append(
+                graph_embeddings
             )
 
         # =====================================================
-        # Batch Tensor
+        # STACK TEMPORAL REPRESENTATIONS
         #
-        # Shape:
+        # Current:
+        #
+        # [
+        #   Batch × Embedding,
+        #   Batch × Embedding,
+        #   ...
+        # ]
+        #
+        # Convert to:
+        #
         # Batch × Sequence × Embedding
-        #
-        # Example:
-        # 16 × 5 × 128
         # =====================================================
 
         temporal_input = torch.stack(
-            batch_spatial_sequences,
-            dim=0
+
+            temporal_embeddings,
+
+            dim=1
+
         )
 
         # =====================================================
-        # Temporal Encoder
+        # TEMPORAL ENCODER
         # =====================================================
 
         temporal_embedding = self.temporal_encoder(
             temporal_input
         )
 
-        # Shape:
-        # Batch × Embedding
+        # =====================================================
+        # CURRENT SPATIAL REPRESENTATION
         #
-        # Example:
-        # 16 × 128
-
-        # =====================================================
-        # Current Spatial Representation
-        # (Last graph of each sequence)
+        # Last graph in temporal sequence
         # =====================================================
 
-        current_spatial = temporal_input[:, -1, :]
+        current_spatial = temporal_input[
+            :,
+            -1,
+            :
+        ]
 
         # =====================================================
-        # Hierarchical Fusion
+        # HIERARCHICAL FUSION
         # =====================================================
 
-        fused_embedding, spatial_weight, temporal_weight = self.fusion(
+        (
+
+            fused_embedding,
+
+            spatial_weight,
+
+            temporal_weight
+
+        ) = self.fusion(
+
             current_spatial,
+
             temporal_embedding
+
         )
 
         # =====================================================
-        # Projection Head
-        # Used for Contrastive Learning
+        # PROJECTION
         # =====================================================
 
         projection = self.projection_head(
             fused_embedding
         )
 
-        # Shape
-        #
-        # Batch × Embedding
-        #
-        # Example
-        #
-        # 16 × 128
-
         # =====================================================
-        # Sequence Classification
+        # CLASSIFICATION
         # =====================================================
 
         logits = self.classifier(
             fused_embedding
         )
 
-        # Shape
-        #
-        # Batch × Classes
-        #
-        # Example
-        #
-        # 16 × 2
-
         # =====================================================
-        # Return Outputs
+        # RETURN
         # =====================================================
 
         return {
+
             "logits": logits,
+
             "embedding": fused_embedding,
+
             "projection": projection,
+
             "spatial_embedding": current_spatial,
+
             "temporal_embedding": temporal_embedding,
+
             "spatial_weight": spatial_weight,
+
             "temporal_weight": temporal_weight
+
         }

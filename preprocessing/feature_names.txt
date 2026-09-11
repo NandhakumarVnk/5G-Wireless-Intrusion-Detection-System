@@ -1,0 +1,95 @@
+  1. Seq
+  2. Dur
+  3. RunTime
+  4. Mean
+  5. Sum
+  6. Min
+  7. Max
+  8. sTos
+  9. dTos
+ 10. sTtl
+ 11. dTtl
+ 12. sHops
+ 13. dHops
+ 14. TotPkts
+ 15. SrcPkts
+ 16. DstPkts
+ 17. TotBytes
+ 18. SrcBytes
+ 19. DstBytes
+ 20. Offset
+ 21. sMeanPktSz
+ 22. dMeanPktSz
+ 23. Load
+ 24. SrcLoad
+ 25. DstLoad
+ 26. Loss
+ 27. SrcLoss
+ 28. DstLoss
+ 29. pLoss
+ 30. SrcGap
+ 31. DstGap
+ 32. Rate
+ 33. SrcRate
+ 34. DstRate
+ 35. SrcWin
+ 36. DstWin
+ 37. sVid
+ 38. dVid
+ 39. SrcTCPBase
+ 40. DstTCPBase
+ 41. TcpRtt
+ 42. SynAck
+ 43. AckDat
+ 44. Label
+ 45. Attack Type
+ 46. Attack Tool
+ 47.  *        
+ 48.  *    V   
+ 49.  *    f   
+ 50.  e        
+ 51.  e    f   
+ 52.  e &      
+ 53.  e *      
+ 54.  e d      
+ 55.  e g      
+ 56.  e i      
+ 57.  e r      
+ 58.  e s      
+ 59.  eU       
+ 60. e        
+ 61. arp
+ 62. icmp
+ 63. ipv6-icmp
+ 64. llc
+ 65. lldp
+ 66. sctp
+ 67. tcp
+ 68. udp
+ 69. ACC
+ 70. CON
+ 71. ECO
+ 72. FIN
+ 73. INT
+ 74. NRS
+ 75. REQ
+ 76. RSP
+ 77. RST
+ 78. TST
+ 79. URP
+ 80. Shutdown
+ 81. Start
+ 82. Status
+ 83. 39
+ 84. 4
+ 85. 52
+ 86. 54
+ 87. af11
+ 88. af12
+ 89. af41
+ 90. cs0
+ 91. cs4
+ 92. cs6
+ 93. cs7
+ 94. ef
+ 95. nan

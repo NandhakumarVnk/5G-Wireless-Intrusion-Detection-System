@@ -1,0 +1,27 @@
+======================================================================
+HTSTCL-GNN FINAL EVALUATION SUMMARY
+======================================================================
+
+Best Epoch: 30
+Best Validation Loss: 0.040201
+Best Validation Accuracy: 98.44%
+
+VALIDATION RESULTS
+----------------------------------------
+Accuracy  : 98.44%
+Precision : 0.9894
+Recall    : 0.9860
+F1 Score  : 0.9877
+
+TEST RESULTS
+----------------------------------------
+Accuracy  : 98.41%
+Precision : 0.9883
+Recall    : 0.9866
+F1 Score  : 0.9875
+ROC-AUC   : 0.9986
+Avg Precision: 0.9993
+
+TEST CONFUSION MATRIX
+[[2607   54]
+ [  62 4573]]
